@@ -1,0 +1,91 @@
+---
+
+- name: Initialising cluster
+  hosts: nodes
+  become: yes
+  tasks:
+    - name: Updating instances
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Rebooting instances
+      reboot:
+
+    - name: Downloading k3s script
+      get_url:
+        url: https://get.k3s.io
+        dest: /tmp/k3s.sh
+        mode: "0555"
+
+- name: Configuring Master node
+  hosts: ocarm1
+  become: yes
+  environment: 
+    INSTALL_K3S_EXEC: "server --tls-san {{ ansible_host }}"
+
+  tasks:
+    - name: Installing k3s
+      shell: /tmp/k3s.sh
+
+    - name: Waiting for k3s node token file
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/k3s/server/node-token
+
+    - name: Copying k3s node token
+      ansible.builtin.command: cat /var/lib/rancher/k3s/server/node-token
+      register: nodetoken
+
+    - name: Store node-token
+      set_fact:
+        token: "{{ nodetoken.stdout }}"
+
+- name: Configuring Worker node
+  hosts: ocarm2
+  become: yes
+  environment: 
+    K3S_URL: https://{{ hostvars['ocarm1']['ansible_default_ipv4']['address'] }}:6443
+    K3S_TOKEN: "{{ hostvars['ocarm1']['token'] }}"
+
+  tasks:
+    - name: Installing k3s
+      shell: /tmp/k3s.sh
+
+- name: Finalising
+  hosts: ocarm1
+  become: yes
+  tasks:
+    - name: Sleep for 10 seconds
+      ansible.builtin.wait_for:
+        timeout: 10
+
+    - name: Adding role to worker node
+      command: kubectl label node ocarm2 kubernetes.io/role=worker
+
+    - name: Write kube config to tmp file
+      shell: "cp /etc/rancher/k3s/k3s.yaml /tmp/conf-with-external-ip; chmod 600 /tmp/conf-with-external-ip"
+
+    - name: Replace IP in config file
+      replace:
+        path: "/tmp/conf-with-external-ip"
+        regexp: 'server: https://[0-9\\.]+:6443'
+        replace: "server: https://{{ ansible_host }}:6443"
+
+    - name: Download kubeconf
+      fetch:
+        src: /tmp/conf-with-external-ip
+        dest: ../kubeconfig
+        flat: yes
+        fail_on_missing: yes
+
+    - name: Linking Control Plane IP to DuckDNS
+      uri:
+        url: "{{ kube_duckdns_url }}"
+
+
+- name: Rebooting
+  hosts: nodes
+  become: yes
+  tasks:
+    - name: Rebooting instances
+      reboot:
